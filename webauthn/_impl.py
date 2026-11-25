@@ -45,6 +45,77 @@
   ``origin``、``rp_id``、``signature``、``counter`` 之一。
 """
 
+import hashlib
+import hmac
+import json
+import secrets
+import struct
+
+
+# 题目固定的公共后缀集合（见 check_rp_id 契约）。
+PUBLIC_SUFFIXES = frozenset(
+    {
+        "com",
+        "org",
+        "net",
+        "edu",
+        "gov",
+        "io",
+        "co",
+        "uk",
+        "co.uk",
+        "org.uk",
+        "com.au",
+        "net.au",
+        "co.jp",
+        "com.br",
+        "co.nz",
+    }
+)
+
+
+def _is_real_int(value) -> bool:
+    """bool 不算 int 的整数判断。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _canonical_client_data_json(value: dict) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _is_valid_domain(value) -> bool:
+    """小写 ASCII 域名：标签非空、至少两个标签、无协议/端口/路径/通配符。"""
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith(".") or value.endswith("."):
+        return False
+    labels = value.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label or label.startswith("-") or label.endswith("-"):
+            return False
+        for char in label:
+            if not (
+                "a" <= char <= "z" or "0" <= char <= "9" or char == "-"
+            ):
+                return False
+    return True
+
+
+def _registrable_suffix(domain: str) -> str:
+    """注册后缀：默认最后两个标签；命中公共后缀集合时取最后三个标签。"""
+    labels = domain.split(".")
+    last_two = ".".join(labels[-2:])
+    if last_two in PUBLIC_SUFFIXES:
+        return ".".join(labels[-3:])
+    return last_two
+
 
 def issue_challenge(store: dict, user: str, now: int, ttl: int) -> dict:
     """签发一个一次性、带过期时间的挑战并写入 ``store``。
@@ -65,7 +136,31 @@ def issue_challenge(store: dict, user: str, now: int, ttl: int) -> dict:
     返回值必须是存储中的记录本身（而不是丢失 ``used`` 变化的副本），以便调用方和
     :func:`check_challenge` 观察到同一份状态。
     """
-    raise NotImplementedError
+    if not _is_real_int(now) or now < 0:
+        raise ValueError("now must be a non-negative int")
+    if not _is_real_int(ttl) or ttl <= 0:
+        raise ValueError("ttl must be a positive int")
+
+    challenges = store.get("challenges")
+    if not isinstance(challenges, dict):
+        challenges = {}
+        store["challenges"] = challenges
+
+    # secrets.token_urlsafe 提供不可预测性；循环保证同用户同时刻连续签发也不重复。
+    challenge = secrets.token_urlsafe(32)
+    while challenge in challenges:
+        challenge = secrets.token_urlsafe(32)
+
+    record = {
+        "challenge": challenge,
+        "user": user,
+        "issued_at": now,
+        "expires_at": now + ttl,
+        "used": False,
+        "used_at": None,
+    }
+    challenges[challenge] = record
+    return record
 
 
 def parse_assertion(raw: dict) -> dict:
@@ -98,7 +193,73 @@ def parse_assertion(raw: dict) -> dict:
     认证器数据长度必须恰好为 37 字节；客户端数据、类型、挑战、来源、字段类型任一
     不合法时抛 ``ValueError``。本函数只解析，不校验来源、RP ID、计数或签名。
     """
-    raise NotImplementedError
+    if not isinstance(raw, dict):
+        raise ValueError("raw assertion must be a mapping")
+
+    credential_id = raw.get("credential_id")
+    if not isinstance(credential_id, bytes):
+        raise ValueError("credential_id must be bytes")
+
+    authenticator_data = raw.get("authenticator_data")
+    if not isinstance(authenticator_data, bytes) or len(authenticator_data) != 37:
+        raise ValueError("authenticator_data must be exactly 37 bytes")
+
+    signature = raw.get("signature")
+    if not isinstance(signature, bytes):
+        raise ValueError("signature must be bytes")
+
+    client_data_input = raw.get("client_data")
+    if isinstance(client_data_input, dict):
+        client_data = client_data_input
+        client_data_json = _canonical_client_data_json(client_data)
+    elif isinstance(client_data_input, bytes):
+        client_data_json = client_data_input
+        client_data = json.loads(client_data_json.decode("utf-8"))
+        if not isinstance(client_data, dict):
+            raise ValueError("client_data JSON must encode an object")
+    elif isinstance(client_data_input, str):
+        client_data_json = client_data_input.encode("utf-8")
+        client_data = json.loads(client_data_input)
+        if not isinstance(client_data, dict):
+            raise ValueError("client_data JSON must encode an object")
+    else:
+        raise ValueError("client_data must be a dict, bytes or str")
+
+    if not isinstance(client_data_json, bytes) or not client_data_json:
+        raise ValueError("client_data_json must be non-empty bytes")
+
+    challenge = client_data.get("challenge")
+    if not isinstance(challenge, str) or not challenge:
+        raise ValueError("client_data.challenge must be a non-empty string")
+
+    origin = client_data.get("origin")
+    if not isinstance(origin, str) or not origin:
+        raise ValueError("client_data.origin must be a non-empty string")
+
+    assertion_type = client_data.get("type")
+    if not isinstance(assertion_type, str) or not assertion_type:
+        raise ValueError("client_data.type must be a non-empty string")
+
+    client_data_hash = hashlib.sha256(client_data_json).digest()
+    rp_id_hash = authenticator_data[:32]
+    flags = authenticator_data[32]
+    sign_count = struct.unpack(">I", authenticator_data[33:37])[0]
+
+    return {
+        "credential_id": credential_id,
+        "client_data": client_data,
+        "client_data_json": client_data_json,
+        "client_data_hash": client_data_hash,
+        "challenge": challenge,
+        "origin": origin,
+        "type": assertion_type,
+        "authenticator_data": authenticator_data,
+        "signature": signature,
+        "rp_id_hash": rp_id_hash,
+        "flags": flags,
+        "sign_count": sign_count,
+        "user_present": bool(flags & 0x01),
+    }
 
 
 def check_challenge(store: dict, challenge: str, now: int) -> bool:
@@ -116,7 +277,33 @@ def check_challenge(store: dict, challenge: str, now: int) -> bool:
     该挑战也不得再次通过。不存在、已使用、已过期或未来签发的挑战返回 ``False``，
     且不得修改其 ``used`` 状态。畸形输入返回 ``False``，不抛异常。
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(challenge, str) or not challenge:
+            return False
+        if not _is_real_int(now) or now < 0:
+            return False
+
+        record = store["challenges"].get(challenge)
+        if not isinstance(record, dict):
+            return False
+        if record.get("used") is not False:
+            return False
+
+        issued_at = record.get("issued_at")
+        expires_at = record.get("expires_at")
+        if not _is_real_int(issued_at) or not _is_real_int(expires_at):
+            return False
+        # 有效区间 issued_at <= now <= expires_at，边界时刻仍然有效；
+        # 同时拒绝未来签发（now < issued_at）与已过期（now > expires_at）。
+        if now < issued_at or now > expires_at:
+            return False
+
+        # 仅在所有条件通过后才作废，失败路径不得改动 used 状态。
+        record["used"] = True
+        record["used_at"] = now
+        return True
+    except (KeyError, TypeError, AttributeError):
+        return False
 
 
 def check_origin(client_data: dict | bytes | str, expected_origin: str) -> bool:
@@ -134,7 +321,30 @@ def check_origin(client_data: dict | bytes | str, expected_origin: str) -> bool:
     这是“精确来源匹配”契约：没有末尾斜杠归一化，也不接受默认端口补全。调用方传入
     什么字符串，就与什么字符串比较。
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(expected_origin, str):
+            return False
+        if isinstance(client_data, dict):
+            origin = client_data.get("origin")
+        elif isinstance(client_data, bytes):
+            parsed = json.loads(client_data.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                return False
+            origin = parsed.get("origin")
+        elif isinstance(client_data, str):
+            parsed = json.loads(client_data)
+            if not isinstance(parsed, dict):
+                return False
+            origin = parsed.get("origin")
+        else:
+            return False
+
+        if not isinstance(origin, str):
+            return False
+        # 完整字符串相等：天然区分协议（http/https）、拒绝子域后缀与任何归一化。
+        return origin == expected_origin
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return False
 
 
 def check_rp_id(rp_id: str, expected_rp: str) -> bool:
@@ -160,7 +370,22 @@ def check_rp_id(rp_id: str, expected_rp: str) -> bool:
     该规则同时阻断三类错误：把 ``com`` 当父域、把任意子域当 ``rp_id``、以及用
     ``"notexample.com"`` 之类的字符串做无边界的后缀比较。
     """
-    raise NotImplementedError
+    if not _is_valid_domain(rp_id) or not _is_valid_domain(expected_rp):
+        return False
+
+    # rp_id 本身不能是公共后缀（如 com、co.uk）。
+    if rp_id in PUBLIC_SUFFIXES:
+        return False
+
+    # 只允许期望值本身，或 expected_rp 的父域（带边界的 "." + rp_id 后缀比较）。
+    if rp_id != expected_rp and not expected_rp.endswith("." + rp_id):
+        return False
+
+    # 注册后缀必须相同，阻断跨注册域的凭证（evil.com vs login.example.com）。
+    if _registrable_suffix(rp_id) != _registrable_suffix(expected_rp):
+        return False
+
+    return True
 
 
 def check_counter(credential: dict, sign_count: int) -> bool:
@@ -180,7 +405,22 @@ def check_counter(credential: dict, sign_count: int) -> bool:
     本函数只判断，不修改凭证状态；只有 :func:`assertion_batch` 在整条断言成功后
     才推进 ``credential["assertion"]["sign_count"]``。
     """
-    raise NotImplementedError
+    try:
+        if not _is_real_int(sign_count) or sign_count < 0:
+            return False
+
+        # 只读取断言状态；注册阶段的计数绝不参与判断，避免污染。
+        accepted = credential["assertion"]["sign_count"]
+        if not _is_real_int(accepted) or accepted < 0:
+            return False
+
+        if accepted > 0:
+            # 已接受计数大于 0：必须严格递增，等于（重放）或清零都拒绝。
+            return sign_count > accepted
+        # 已接受计数为 0：兼容不支持计数器的认证器，0 与正数都接受，负数已在上面拒绝。
+        return sign_count >= 0
+    except (KeyError, TypeError):
+        return False
 
 
 def verify_signature(
@@ -206,7 +446,39 @@ def verify_signature(
     会与挑战脱钩，同一认证器数据可被换到另一个挑战上。任何类型、长度或内容不匹配
     都返回 ``False``，不抛异常。本函数不校验挑战一次性、来源、RP ID 策略或计数。
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(client_data_hash, bytes) or len(client_data_hash) != 32:
+            return False
+        if not isinstance(authenticator_data, bytes) or len(authenticator_data) != 37:
+            return False
+        if not isinstance(signature, bytes) or len(signature) != 32:
+            return False
+
+        public_key = credential["public_key"]
+        if not isinstance(public_key, bytes) or not public_key:
+            return False
+        rp_id = credential["rp_id"]
+        if not isinstance(rp_id, str):
+            return False
+
+        # RP 绑定：认证器数据前 32 字节必须是凭证所属 rp_id 的哈希。
+        expected_rp_id_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+        if not hmac.compare_digest(authenticator_data[:32], expected_rp_id_hash):
+            return False
+
+        # 用户在场标志（bit 0）必须置位。
+        if authenticator_data[32] & 0x01 == 0:
+            return False
+
+        # 签名输入同时覆盖客户端数据摘要与认证器数据，使签名与挑战绑定。
+        expected_signature = hmac.new(
+            public_key,
+            client_data_hash + authenticator_data,
+            hashlib.sha256,
+        ).digest()
+        return hmac.compare_digest(signature, expected_signature)
+    except (KeyError, TypeError):
+        return False
 
 
 def assertion_batch(requests: list[dict], policy: dict, now: int) -> dict:
@@ -248,4 +520,80 @@ def assertion_batch(requests: list[dict], policy: dict, now: int) -> dict:
     类型错误或 ``raw`` 无法解析时该请求失败并归入 ``parse_error``，不得让整批抛异常；
     重复 id 合法，结果仍按位置返回。
     """
-    raise NotImplementedError
+    store = policy["store"]
+    expected_origin = policy["expected_origin"]
+    expected_rp_id = policy["expected_rp_id"]
+
+    results = []
+    accepted = []
+    rejected = []
+
+    for request in requests:
+        request_id = request.get("id") if isinstance(request, dict) else None
+        result = {"id": request_id, "ok": False, "reason": None}
+        results.append(result)
+
+        try:
+            # 每个请求独立解析自己的 raw，绝不复用上一个请求的任何状态。
+            if not isinstance(request, dict):
+                raise ValueError("request must be a mapping")
+            credential = request["credential"]
+            raw = request["raw"]
+            if not isinstance(credential, dict):
+                raise ValueError("credential must be a mapping")
+
+            parsed = parse_assertion(raw)
+        except (KeyError, TypeError, ValueError):
+            result["reason"] = "parse_error"
+            rejected.append(request_id)
+            continue
+
+        # 凭证标识必须与请求携带的凭证一致。
+        if parsed["credential_id"] != credential.get("credential_id"):
+            result["reason"] = "credential_mismatch"
+            rejected.append(request_id)
+            continue
+
+        # 挑战：成功即作废，即使后续检查失败也不回滚；第二个同挑战请求在此失败。
+        if not check_challenge(store, parsed["challenge"], now):
+            result["reason"] = "challenge"
+            rejected.append(request_id)
+            continue
+
+        if not check_origin(parsed["client_data"], expected_origin):
+            result["reason"] = "origin"
+            rejected.append(request_id)
+            continue
+
+        if not check_rp_id(credential["rp_id"], expected_rp_id):
+            result["reason"] = "rp_id"
+            rejected.append(request_id)
+            continue
+
+        if not verify_signature(
+            credential,
+            parsed["client_data_hash"],
+            parsed["authenticator_data"],
+            parsed["signature"],
+        ):
+            result["reason"] = "signature"
+            rejected.append(request_id)
+            continue
+
+        if not check_counter(credential, parsed["sign_count"]):
+            result["reason"] = "counter"
+            rejected.append(request_id)
+            continue
+
+        # 全部检查通过后才推进断言计数；失败路径不会修改凭证状态。
+        credential["assertion"]["sign_count"] = parsed["sign_count"]
+        result["ok"] = True
+        result["reason"] = None
+        accepted.append(request_id)
+
+    return {
+        "ok": len(rejected) == 0,
+        "accepted": accepted,
+        "rejected": rejected,
+        "results": results,
+    }
